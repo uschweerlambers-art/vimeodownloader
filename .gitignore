@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.part
+.vimeo_library_downloader.json
+vimeo_manifest.json
+Vimeo_Videoliste.*
