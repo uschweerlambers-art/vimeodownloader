@@ -288,7 +288,10 @@ class Downloader:
 
     def csv_videos(self):
         items = read_link_csv(self.csv_path)
-        self.log(f"CSV: {Path(self.csv_path).name}  ·  {len(items)} Links gefunden")
+        with_link = sum(1 for it in items if it["link"])
+        total_size = sum(it["size"] or 0 for it in items if it["link"])
+        self.log(f"CSV: {Path(self.csv_path).name}  ·  {len(items)} Videos, {with_link} mit Download-Link"
+                 + (f"  ·  zusammen ca. {human(total_size)}" if total_size else ""))
         now = time.time()
         exp = [link_expiry(it["link"]) for it in items if it["link"]]
         expired = sum(1 for e in exp if e and e < now)
