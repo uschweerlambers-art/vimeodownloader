@@ -10,6 +10,7 @@ Lädt alle Videos aus dem **eigenen** Vimeo-Account herunter – über die offiz
 - Überspringt bereits geladene Videos, setzt abgebrochene Downloads (`.part`) fort
 - Holt abgelaufene Download-Links automatisch neu, beachtet API-Limits
 - **Testlauf** (`--dry-run`): geht die ganze Library durch, lädt aber nichts
+- **CSV-Import:** Download-Links aus einer CSV vom Vimeo-Support (für Tarife ohne API-Download-Links, z. B. Plus) – kein Token nötig
 - Nach jedem Lauf: nummerierte **Videoliste** (`Vimeo_Videoliste.txt` + `.csv` für Excel) und `vimeo_manifest.json`
 
 ## Voraussetzungen
@@ -34,8 +35,21 @@ python vimeo_downloader.py --token DEIN_TOKEN --out "D:/Vimeo Backup" --quality 
 python vimeo_downloader.py --dry-run          # nur Liste erzeugen
 ```
 
-Optionen: `--token`, `--out`, `--quality {best,2160,1440,1080,720,540,360}`, `--no-folders`, `--dry-run`, `--gui`.  
+Optionen: `--token`, `--csv`, `--out`, `--quality {best,2160,1440,1080,720,540,360}`, `--no-folders`, `--dry-run`, `--gui`.  
 Der Token kann auch über die Umgebungsvariable `VIMEO_TOKEN` kommen.
+
+## Ohne API-Download-Links (z. B. Plus-Tarif)
+
+Vimeo liefert Download-Links über die API erst ab dem Standard-Tarif. Alternative: beim Vimeo-Support
+([vimeo.com/help/contact](https://vimeo.com/help/contact)) eine **Bulk-Download-CSV der eigenen Library** anfordern.
+Diese Datei in der GUI unter „CSV (optional)“ wählen oder:
+
+```
+python vimeo_downloader.py --csv vimeo_links.csv --out "D:/Vimeo Backup"
+```
+
+Spalten werden automatisch erkannt (Link, Titel, Video-ID, Größe, Ordner; Trennzeichen `,` `;` Tab). Eine reine Liste
+mit einem Link pro Zeile funktioniert auch. Abgelaufene Links werden gemeldet – die Links gelten nur ca. 7 Tage.
 
 ## Dateinamen
 

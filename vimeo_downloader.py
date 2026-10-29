@@ -14,6 +14,8 @@ Start
   * Ohne Argumente:            GUI
   * Kommandozeile, Beispiel:   python vimeo_downloader.py --token XYZ --out "D:/Vimeo Backup" --quality best
   * Token geht auch per Umgebungsvariable VIMEO_TOKEN.
+  * Ohne API-Download-Links (z. B. Plus-Tarif): CSV mit Links beim Vimeo-Support anfordern,
+    dann  python vimeo_downloader.py --csv vimeo_links.csv  (kein Token nötig).
 
 Verhalten
   * Bereits geladene Videos werden übersprungen (erkannt an der Video-ID im Dateinamen).
@@ -90,14 +92,95 @@ def guess_ext(resp, entry):
     return TYPE_EXT.get(entry.get("type", ""), ".mp4")
 
 
+def link_expiry(url):
+    """Liest einen Ablaufzeitpunkt (Unix-Zeit) aus signierten Links, falls vorhanden."""
+    from urllib.parse import parse_qs
+    q = {k.lower(): v for k, v in parse_qs(urlparse(url).query).items()}
+    for key in ("expires", "exp", "e", "x-amz-expires-at"):
+        if key in q:
+            try:
+                val = int(q[key][0])
+                if val > 1_000_000_000:
+                    return val
+            except ValueError:
+                pass
+    return None
+
+
+def read_link_csv(path):
+    """Liest eine Link-Liste (CSV vom Vimeo-Support oder einfache URL-Liste).
+
+    Das genaue Spaltenformat ist nicht dokumentiert – daher werden die Spalten
+    anhand ihrer Überschriften und Inhalte erkannt:
+      Link:  Spalte, deren Werte mit http beginnen (bevorzugt: download/source/original/url/link)
+      Name:  Überschrift mit title/name/titel
+      ID:    Überschrift mit id (sonst aus vimeo.com/123… im Link)
+      Größe: Überschrift mit size/bytes/größe
+    """
+    import csv
+    raw = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+    lines = [l for l in raw.splitlines() if l.strip()]
+    if not lines:
+        return []
+    try:
+        dialect = csv.Sniffer().sniff("\n".join(lines[:20]), delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    rows = list(csv.reader(lines, dialect))
+    is_url = lambda s: s.strip().lower().startswith(("http://", "https://"))
+    has_header = not any(is_url(c) for c in rows[0])
+    header = [h.strip().lower() for h in rows[0]] if has_header else []
+    data = rows[1:] if has_header else rows
+    ncols = max(len(r) for r in rows)
+
+    def col(*words, exclude=()):
+        for i, h in enumerate(header):
+            if any(w in h for w in words) and not any(x in h for x in exclude):
+                return i
+        return None
+
+    url_cols = [i for i in range(ncols)
+                if sum(1 for r in data if i < len(r) and is_url(r[i])) >= max(1, len(data) // 2)]
+    if not url_cols:
+        raise ValueError("In der Datei wurden keine Links (http…) gefunden.")
+    pref = [i for i in url_cols if i < len(header) and any(
+        w in header[i] for w in ("download", "source", "original", "file", "url", "link"))]
+    pref.sort(key=lambda i: 0 if any(w in header[i] for w in ("download", "source", "original")) else 1)
+    url_col = (pref or url_cols)[0]
+    name_col = col("title", "titel", "name", exclude=("file", "user", "owner", "folder"))
+    id_col = col("video id", "video_id", "clip id", "clip_id", "videoid")
+    if id_col is None:
+        id_col = col("id", exclude=("width", "video_url", "url", "link"))
+    size_col = col("size", "bytes", "größe", "groesse")
+    folder_col = col("folder", "ordner", "project")
+
+    items = []
+    for n, r in enumerate(data, 1):
+        get = lambda i: r[i].strip() if i is not None and i < len(r) else ""
+        link = get(url_col)
+        if not is_url(link):
+            continue
+        vid = get(id_col)
+        if not vid.isdigit():
+            m = re.search(r"vimeo\.com/(?:video/|videos/)?(\d{5,})", link) or \
+                next((re.search(r"vimeo\.com/(?:video/|videos/)?(\d{5,})", c) for c in r if "vimeo.com/" in c), None)
+            vid = m.group(1) if m else f"csv{n}"
+        name = get(name_col) or unquote(os.path.basename(urlparse(link).path)).rsplit(".", 1)[0] or vid
+        size = get(size_col).replace(".", "").replace(",", "")
+        items.append({"name": name, "id": vid, "link": link, "folder": get(folder_col),
+                      "size": int(size) if size.isdigit() else None})
+    return items
+
+
 class Stopped(Exception):
     pass
 
 
 class Downloader:
     def __init__(self, token, out_dir, quality="best", by_folder=True, dry_run=False,
-                 log=print, progress=None, stop_event=None):
+                 log=print, progress=None, stop_event=None, csv_path=None):
         self.out = Path(out_dir)
+        self.csv_path = csv_path
         self.quality = quality
         self.by_folder = by_folder
         self.dry_run = dry_run
@@ -106,7 +189,7 @@ class Downloader:
         self.stop_event = stop_event or threading.Event()
         self.api = requests.Session()
         self.api.headers.update({
-            "Authorization": f"bearer {token.strip()}",
+            "Authorization": f"bearer {(token or '').strip()}",
             "Accept": "application/vnd.vimeo.*+json;version=3.4",
             "User-Agent": "VimeoLibraryDownloader/1.0",
         })
@@ -186,12 +269,33 @@ class Downloader:
                 break
             page = self.api_get(nxt)
 
+    def csv_videos(self):
+        items = read_link_csv(self.csv_path)
+        self.log(f"CSV: {Path(self.csv_path).name}  ·  {len(items)} Links gefunden")
+        now = time.time()
+        exp = [link_expiry(it["link"]) for it in items]
+        expired = sum(1 for e in exp if e and e < now)
+        known = [e for e in exp if e and e >= now]
+        if expired:
+            self.log(f"WARNUNG: {expired} Links sind bereits abgelaufen – ggf. neue CSV beim Vimeo-Support anfordern.")
+        if known:
+            self.log("Links gültig bis ca. " + datetime.fromtimestamp(min(known)).strftime("%d.%m.%Y %H:%M"))
+        for i, it in enumerate(items, 1):
+            yield i, len(items), {
+                "uri": f"/videos/{it['id']}", "name": it["name"], "created_time": "", "duration": None,
+                "parent_folder": {"name": it["folder"]} if it["folder"] else None, "_csv": True,
+                "download": [{"link": it["link"], "size": it["size"], "quality": "source", "rendition": "CSV"}]}
+
     def run(self):
         self.out.mkdir(parents=True, exist_ok=True)
-        self.check_account()
+        if self.csv_path:
+            source = self.csv_videos()
+        else:
+            self.check_account()
+            source = self.videos()
         stats = {"geladen": 0, "übersprungen": 0, "fehler": 0, "ohne_link": 0, "testlauf": 0}
         try:
-            for i, total, v in self.videos():
+            for i, total, v in source:
                 self.progress("overall", i - 1, total)
                 status = self.handle(i, total, v)
                 stats[status] = stats.get(status, 0) + 1
@@ -216,7 +320,7 @@ class Downloader:
         folder_name = ((v.get("parent_folder") or {}).get("name") or "")
         folder = self.out / safe_name(folder_name) if (self.by_folder and folder_name) else self.out
         base = f"{date} {safe_name(name)} [{vid}]".strip()
-        entry = pick_file(v.get("download"), self.quality)
+        entry = v["download"][0] if v.get("_csv") else pick_file(v.get("download"), self.quality)
         rec = {"nr": i, "id": vid, "name": name, "created": v.get("created_time"),
                "duration": v.get("duration"), "folder": folder_name,
                "quality": (entry.get("rendition") or entry.get("quality")) if entry else "",
@@ -231,12 +335,17 @@ class Downloader:
             return "ohne_link"
 
         existing = self.find_existing(folder, vid)
-        if existing and (not entry.get("size") or existing.stat().st_size == entry["size"]):
+        if existing and (not entry.get("size") or entry.get("rendition") == "CSV"
+                         or existing.stat().st_size == entry["size"]):
             self.log(f"{label}  –  schon vorhanden, übersprungen")
             rec.update(file=str(existing), status="übersprungen")
             return "übersprungen"
 
-        info = f"{entry.get('rendition') or entry.get('quality')} · {human(entry.get('size'))}"
+        size_txt = human(entry.get("size")) if entry.get("size") else "Größe unbekannt"
+        info = f"{entry.get('rendition') or entry.get('quality')} · {size_txt}"
+        exp = link_expiry(entry["link"]) if v.get("_csv") else None
+        if exp and exp < time.time():
+            info += " · LINK ABGELAUFEN"
         if self.dry_run:
             self.log(f"{label}  –  würde laden: {info}  →  {folder.name or self.out}")
             rec["status"] = "testlauf"
@@ -252,6 +361,9 @@ class Downloader:
             except Stopped:
                 raise
             except LinkExpired:
+                if v.get("_csv"):
+                    self.log("  Link abgelaufen oder gesperrt (403/410) – neue CSV beim Vimeo-Support anfordern.")
+                    break
                 self.log("  Link abgelaufen – hole neuen …")
                 fresh = self.api_get(v["uri"], {"fields": "download"})
                 entry = pick_file(fresh.get("download"), self.quality) or entry
@@ -300,7 +412,7 @@ class Downloader:
                             self.progress("file", done, total)
                             last = time.time()
         self.progress("file", done, total)
-        if entry.get("size") and done != entry["size"]:
+        if entry.get("size") and done != entry["size"] and entry.get("rendition") != "CSV":
             raise RuntimeError(f"Größe stimmt nicht ({human(done)} statt {human(entry['size'])})")
         final = folder / f"{base}{ext}"
         part.replace(final)
@@ -319,7 +431,9 @@ class Downloader:
     def write_list(self):
         """Nummerierte Videoliste als Text (zum Lesen) und CSV (für Excel)."""
         def dur(s):
-            s = int(s or 0)
+            if not s:
+                return ""
+            s = int(s)
             return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
 
         rows = self.manifest
@@ -332,7 +446,7 @@ class Downloader:
             extra = " · ".join(x for x in (
                 (r.get("created") or "")[:10], dur(r.get("duration")),
                 r.get("folder") and f"Ordner: {r['folder']}") if x)
-            lines.append(f"{str(r['nr']).rjust(width)}. {r['name']}   ({extra})")
+            lines.append(f"{str(r['nr']).rjust(width)}. {r['name']}" + (f"   ({extra})" if extra else ""))
         txt = self.out / "Vimeo_Videoliste.txt"
         csv_path = self.out / "Vimeo_Videoliste.csv"
         try:
@@ -391,6 +505,13 @@ was geladen würde, ohne etwas zu laden.
 Nach jedem Lauf liegt im Zielordner eine nummerierte Videoliste:
 Vimeo_Videoliste.txt (zum Lesen) und Vimeo_Videoliste.csv (für Excel).
 
+CSV vom Vimeo-Support (optional)
+   Liefert die API keine Download-Links (z. B. beim Plus-Tarif), kann man beim
+   Vimeo-Support eine CSV mit Download-Links der ganzen Library anfordern.
+   Diese hier auswählen – dann wird kein Token gebraucht.
+   Die Links laufen nach ca. 7 Tagen ab, also zügig laden.
+   × leert das Feld (zurück zum Laden per Token).
+
 Erneut starten ist gefahrlos: Vorhandenes wird übersprungen,
 abgebrochene Downloads werden fortgesetzt.
 
@@ -408,7 +529,7 @@ def run_gui():
     root = tk.Tk()
     root.title("Vimeo Library Downloader")
     root.configure(bg=BG)
-    root.minsize(640, 560)
+    root.minsize(660, 600)
 
     st = ttk.Style(root)
     st.theme_use("clam")
@@ -448,6 +569,7 @@ def run_gui():
     remember = tk.BooleanVar(value=bool(cfg.get("token")))
     by_folder = tk.BooleanVar(value=cfg.get("by_folder", True))
     dry = tk.BooleanVar(value=False)
+    csv_file = tk.StringVar(value="")
 
     ttk.Label(frm, text="Access Token").grid(row=1, column=0, sticky="w", pady=4)
     ent = ttk.Entry(frm, textvariable=token, show="•")
@@ -462,36 +584,44 @@ def run_gui():
                command=lambda: out.set(filedialog.askdirectory(initialdir=out.get()) or out.get())
                ).grid(row=2, column=2, sticky="w")
 
-    ttk.Label(frm, text="Qualität").grid(row=3, column=0, sticky="w", pady=4)
+    ttk.Label(frm, text="CSV (optional)").grid(row=3, column=0, sticky="w", pady=4)
+    ttk.Entry(frm, textvariable=csv_file).grid(row=3, column=1, sticky="ew", padx=8)
+    csv_btns = ttk.Frame(frm)
+    csv_btns.grid(row=3, column=2, sticky="w")
+    ttk.Button(csv_btns, text="…", width=3, command=lambda: csv_file.set(filedialog.askopenfilename(
+        filetypes=[("CSV / Text", "*.csv *.txt *.tsv"), ("Alle Dateien", "*.*")]) or csv_file.get())).pack(side="left")
+    ttk.Button(csv_btns, text="×", width=2, command=lambda: csv_file.set("")).pack(side="left", padx=(4, 0))
+
+    ttk.Label(frm, text="Qualität").grid(row=4, column=0, sticky="w", pady=4)
     ttk.Combobox(frm, textvariable=quality, values=QUALITIES, state="readonly", width=10
-                 ).grid(row=3, column=1, sticky="w", padx=8)
+                 ).grid(row=4, column=1, sticky="w", padx=8)
 
     opts = ttk.Frame(frm)
-    opts.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 10))
+    opts.grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 10))
     ttk.Checkbutton(opts, text="Vimeo-Ordner nachbauen", variable=by_folder).pack(side="left", padx=(0, 16))
     ttk.Checkbutton(opts, text="Nur auflisten (Testlauf)", variable=dry).pack(side="left", padx=(0, 16))
     ttk.Checkbutton(opts, text="Token merken", variable=remember).pack(side="left")
 
     btns = ttk.Frame(frm)
-    btns.grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 12))
+    btns.grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 12))
     start_btn = ttk.Button(btns, text="Start", style="Accent.TButton")
     stop_btn = ttk.Button(btns, text="Stopp", state="disabled")
     start_btn.pack(side="left", padx=(0, 8))
     stop_btn.pack(side="left")
 
     overall_lbl = ttk.Label(frm, text="Gesamt", style="Muted.TLabel")
-    overall_lbl.grid(row=6, column=0, columnspan=3, sticky="w")
+    overall_lbl.grid(row=7, column=0, columnspan=3, sticky="w")
     overall = ttk.Progressbar(frm, style="O.Horizontal.TProgressbar", maximum=1)
-    overall.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(2, 8))
+    overall.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(2, 8))
     file_lbl = ttk.Label(frm, text="Aktuelle Datei", style="Muted.TLabel")
-    file_lbl.grid(row=8, column=0, columnspan=3, sticky="w")
+    file_lbl.grid(row=9, column=0, columnspan=3, sticky="w")
     filebar = ttk.Progressbar(frm, style="O.Horizontal.TProgressbar", maximum=1)
-    filebar.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(2, 10))
+    filebar.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(2, 10))
 
     logbox = tk.Text(frm, height=14, bg=PANEL, fg=FG, insertbackground=FG, relief="flat",
                      font=("Consolas", 9), wrap="word", padx=8, pady=6)
-    logbox.grid(row=10, column=0, columnspan=3, sticky="nsew")
-    frm.rowconfigure(10, weight=1)
+    logbox.grid(row=11, column=0, columnspan=3, sticky="nsew")
+    frm.rowconfigure(11, weight=1)
 
     q = queue.Queue()
     stop_event = threading.Event()
@@ -530,8 +660,12 @@ def run_gui():
             q.put(("end",))
 
     def start():
-        if not token.get().strip():
-            messagebox.showwarning("Token fehlt", "Bitte einen Vimeo Access Token eintragen (Hilfe: „i“).")
+        if csv_file.get().strip() and not os.path.isfile(csv_file.get().strip()):
+            messagebox.showwarning("CSV nicht gefunden", "Die gewählte CSV-Datei existiert nicht.")
+            return
+        if not token.get().strip() and not csv_file.get().strip():
+            messagebox.showwarning("Token fehlt", "Bitte einen Vimeo Access Token eintragen "
+                                   "oder eine CSV vom Vimeo-Support wählen (Hilfe: „i“).")
             return
         save_config({"token": token.get().strip() if remember.get() else "", "out": out.get(),
                      "quality": quality.get(), "by_folder": by_folder.get()})
@@ -541,7 +675,8 @@ def run_gui():
         stop_btn.configure(state="normal")
         threading.Thread(target=worker, daemon=True, args=({
             "token": token.get(), "out_dir": out.get(), "quality": quality.get(),
-            "by_folder": by_folder.get(), "dry_run": dry.get()},)).start()
+            "by_folder": by_folder.get(), "dry_run": dry.get(),
+            "csv_path": csv_file.get().strip() or None},)).start()
 
     def stop():
         stop_event.set()
@@ -557,8 +692,8 @@ def run_gui():
 def run_cli(a):
     cfg = load_config()
     token = a.token or os.environ.get("VIMEO_TOKEN") or cfg.get("token")
-    if not token:
-        print("Kein Token. --token angeben oder VIMEO_TOKEN setzen.")
+    if not token and not a.csv:
+        print("Kein Token. --token angeben, VIMEO_TOKEN setzen oder --csv nutzen.")
         sys.exit(2)
 
     def progress(kind, done, total):
@@ -570,7 +705,7 @@ def run_cli(a):
 
     stop_event = threading.Event()
     d = Downloader(token, a.out, a.quality, not a.no_folders, a.dry_run,
-                   progress=progress, stop_event=stop_event)
+                   progress=progress, stop_event=stop_event, csv_path=a.csv)
     try:
         stats = d.run()
     except KeyboardInterrupt:
@@ -587,6 +722,7 @@ def main():
     p.add_argument("--out", default=DEFAULT_OUT, help="Zielordner")
     p.add_argument("--quality", default="best", choices=QUALITIES, help="best = Original, sonst max. Höhe")
     p.add_argument("--no-folders", action="store_true", help="Vimeo-Ordnerstruktur nicht nachbauen")
+    p.add_argument("--csv", help="CSV mit Download-Links vom Vimeo-Support (statt API, kein Token nötig)")
     p.add_argument("--dry-run", action="store_true", help="Nur auflisten, nichts laden")
     p.add_argument("--gui", action="store_true", help="GUI erzwingen")
     a = p.parse_args()
