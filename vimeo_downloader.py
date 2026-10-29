@@ -118,15 +118,15 @@ def read_link_csv(path):
       Größe: Überschrift mit size/bytes/größe
     """
     import csv
+    import io
     raw = Path(path).read_text(encoding="utf-8-sig", errors="replace")
-    lines = [l for l in raw.splitlines() if l.strip()]
-    if not lines:
+    if not raw.strip():
         return []
-    try:
-        dialect = csv.Sniffer().sniff("\n".join(lines[:20]), delimiters=",;\t|")
-    except csv.Error:
-        dialect = csv.excel
-    rows = list(csv.reader(lines, dialect))
+    # Trennzeichen aus der ersten Zeile zählen (Sniffer rät bei "" in Feldern oft falsch)
+    first = raw.split("\n", 1)[0]
+    delim = max(",;\t|", key=first.count) if any(c in first for c in ",;\t|") else ","
+    # csv.reader direkt auf dem Text: Felder mit Zeilenumbrüchen (Beschreibungen) bleiben intakt
+    rows = [r for r in csv.reader(io.StringIO(raw), delimiter=delim) if any(c.strip() for c in r)]
     is_url = lambda s: s.strip().lower().startswith(("http://", "https://"))
     has_header = not any(is_url(c) for c in rows[0])
     header = [h.strip().lower() for h in rows[0]] if has_header else []
@@ -152,23 +152,40 @@ def read_link_csv(path):
     if id_col is None:
         id_col = col("id", exclude=("width", "video_url", "url", "link"))
     size_col = col("size", "bytes", "größe", "groesse")
-    folder_col = col("folder", "ordner", "project")
+    folder_col = col("folder name", "folder", "ordner", "project", exclude=("id",))
+    date_col = col("upload date", "created", "datum", "date")
+    dur_col = col("duration", "dauer")
+
+    def parse_size(t):
+        t = t.strip().upper().replace(" ", "")
+        m = re.fullmatch(r"([\d.,]+)(B|KB|MB|GB|TB)?", t)
+        if not m:
+            return None
+        num = m.group(1)
+        if m.group(2):  # "20.297MB" – Punkt/Komma ist Dezimaltrenner
+            val = float(num.replace(",", "."))
+            return int(val * 1024 ** ("B KB MB GB TB".split().index(m.group(2))))
+        digits = num.replace(".", "").replace(",", "")
+        return int(digits) if digits.isdigit() else None
 
     items = []
     for n, r in enumerate(data, 1):
         get = lambda i: r[i].strip() if i is not None and i < len(r) else ""
         link = get(url_col)
         if not is_url(link):
-            continue
+            link = ""  # Zeile ohne Link bleibt in der Liste (Status: ohne Download-Link)
         vid = get(id_col)
         if not vid.isdigit():
             m = re.search(r"vimeo\.com/(?:video/|videos/)?(\d{5,})", link) or \
                 next((re.search(r"vimeo\.com/(?:video/|videos/)?(\d{5,})", c) for c in r if "vimeo.com/" in c), None)
             vid = m.group(1) if m else f"csv{n}"
-        name = get(name_col) or unquote(os.path.basename(urlparse(link).path)).rsplit(".", 1)[0] or vid
-        size = get(size_col).replace(".", "").replace(",", "")
+        name = get(name_col) or (unquote(os.path.basename(urlparse(link).path)).rsplit(".", 1)[0] if link else "") or vid
+        if not get(name_col) and not link:
+            name = vid
+        dur = get(dur_col)
         items.append({"name": name, "id": vid, "link": link, "folder": get(folder_col),
-                      "size": int(size) if size.isdigit() else None})
+                      "size": parse_size(get(size_col)), "created": get(date_col),
+                      "duration": int(float(dur)) if re.fullmatch(r"\d+(\.\d+)?", dur) else None})
     return items
 
 
@@ -273,7 +290,7 @@ class Downloader:
         items = read_link_csv(self.csv_path)
         self.log(f"CSV: {Path(self.csv_path).name}  ·  {len(items)} Links gefunden")
         now = time.time()
-        exp = [link_expiry(it["link"]) for it in items]
+        exp = [link_expiry(it["link"]) for it in items if it["link"]]
         expired = sum(1 for e in exp if e and e < now)
         known = [e for e in exp if e and e >= now]
         if expired:
@@ -282,9 +299,11 @@ class Downloader:
             self.log("Links gültig bis ca. " + datetime.fromtimestamp(min(known)).strftime("%d.%m.%Y %H:%M"))
         for i, it in enumerate(items, 1):
             yield i, len(items), {
-                "uri": f"/videos/{it['id']}", "name": it["name"], "created_time": "", "duration": None,
+                "uri": f"/videos/{it['id']}", "name": it["name"],
+                "created_time": it.get("created") or "", "duration": it.get("duration"),
                 "parent_folder": {"name": it["folder"]} if it["folder"] else None, "_csv": True,
-                "download": [{"link": it["link"], "size": it["size"], "quality": "source", "rendition": "CSV"}]}
+                "download": [{"link": it["link"], "size": it["size"], "quality": "source", "rendition": "CSV"}]
+                if it["link"] else []}
 
     def run(self):
         self.out.mkdir(parents=True, exist_ok=True)
@@ -320,7 +339,10 @@ class Downloader:
         folder_name = ((v.get("parent_folder") or {}).get("name") or "")
         folder = self.out / safe_name(folder_name) if (self.by_folder and folder_name) else self.out
         base = f"{date} {safe_name(name)} [{vid}]".strip()
-        entry = v["download"][0] if v.get("_csv") else pick_file(v.get("download"), self.quality)
+        if v.get("_csv"):
+            entry = v["download"][0] if v.get("download") else None
+        else:
+            entry = pick_file(v.get("download"), self.quality)
         rec = {"nr": i, "id": vid, "name": name, "created": v.get("created_time"),
                "duration": v.get("duration"), "folder": folder_name,
                "quality": (entry.get("rendition") or entry.get("quality")) if entry else "",
